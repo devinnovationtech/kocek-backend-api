@@ -1,0 +1,262 @@
+<?php
+
+namespace Tests\Units\Domain;
+
+use App\Internal\Events\BalanceUpdatedEventInterface;
+use App\Internal\Events\TransactionCreatedEventInterface;
+use App\Internal\Events\WalletCreatedEventInterface;
+use App\Internal\Exceptions\ExceptionInterface;
+use App\Internal\Service\ClockServiceInterface;
+use App\Internal\Service\DatabaseServiceInterface;
+use App\Internal\Service\UuidFactoryServiceInterface;
+use App\Models\Transaction;
+use App\Objects\Cart;
+use App\Services\PurchaseServiceInterface;
+use Tests\Infra\Exceptions\UnknownEventException;
+use Tests\Infra\Factories\BuyerFactory;
+use Tests\Infra\Factories\ItemFactory;
+use Tests\Infra\Factories\UserMultiFactory;
+use Tests\Infra\Listeners\BalanceUpdatedThrowDateListener;
+use Tests\Infra\Listeners\BalanceUpdatedThrowIdListener;
+use Tests\Infra\Listeners\BalanceUpdatedThrowUuidListener;
+use Tests\Infra\Listeners\TransactionCreatedThrowListener;
+use Tests\Infra\Listeners\WalletCreatedThrowListener;
+use Tests\Infra\Models\Buyer;
+use Tests\Infra\Models\Item;
+use Tests\Infra\Models\UserMulti;
+use Tests\Infra\Services\ClockFakeService;
+use Tests\TestCase;
+use DateTimeInterface;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Support\Facades\Event;
+
+/**
+ * @internal
+ */
+final class EventTest extends TestCase
+{
+    public function testBalanceUpdatedThrowUuidListener(): void
+    {
+        Event::listen(BalanceUpdatedEventInterface::class, BalanceUpdatedThrowUuidListener::class);
+
+        /** @var Buyer $buyer */
+        $buyer = BuyerFactory::new()->create();
+        self::assertSame(0, $buyer->wallet->balanceInt);
+        self::assertTrue($buyer->wallet->saveQuietly()); // create without event
+
+        // unit
+        $this->expectException(UnknownEventException::class);
+        $this->expectExceptionMessage($buyer->wallet->uuid);
+        $this->expectExceptionCode(123 + $buyer->wallet->getKey());
+
+        $buyer->deposit(123);
+    }
+
+    public function testBalanceUpdatedThrowIdListener(): void
+    {
+        Event::listen(BalanceUpdatedEventInterface::class, BalanceUpdatedThrowIdListener::class);
+
+        /** @var Buyer $buyer */
+        $buyer = BuyerFactory::new()->create();
+        self::assertSame(0, $buyer->wallet->balanceInt); // no create wallet
+
+        // unit
+        $this->expectException(UnknownEventException::class);
+        $this->expectExceptionMessage($buyer->wallet->uuid);
+        $this->expectExceptionCode(456);
+
+        $buyer->deposit(456);
+    }
+
+    public function testBalanceUpdatedThrowDateListener(): void
+    {
+        $this->app?->bind(ClockServiceInterface::class, ClockFakeService::class);
+
+        Event::listen(BalanceUpdatedEventInterface::class, BalanceUpdatedThrowDateListener::class);
+
+        /** @var Buyer $buyer */
+        $buyer = BuyerFactory::new()->create();
+        self::assertSame(0, $buyer->wallet->balanceInt);
+
+        // unit
+        $this->expectException(UnknownEventException::class);
+        $this->expectExceptionCode(789);
+
+        $buyer->deposit(789);
+    }
+
+    public function testWalletCreatedThrowListener(): void
+    {
+        $this->app?->bind(ClockServiceInterface::class, ClockFakeService::class);
+
+        Event::listen(WalletCreatedEventInterface::class, WalletCreatedThrowListener::class);
+
+        /** @var Buyer $buyer */
+        $buyer = BuyerFactory::new()->create();
+
+        $uuidFactoryService = app(UuidFactoryServiceInterface::class);
+        $buyer->wallet->uuid = $uuidFactoryService->uuid4();
+
+        $holderType = $buyer->getMorphClass();
+        $uuid = $buyer->wallet->uuid;
+        $createdAt = app(ClockServiceInterface::class)->now()->format(DateTimeInterface::ATOM);
+
+        $message = hash('sha256', $holderType . $uuid . $createdAt);
+
+        // unit
+        $this->expectException(UnknownEventException::class);
+        $this->expectExceptionMessage($message);
+
+        $buyer->withdraw(0);
+    }
+
+    public function testMultiWalletCreatedThrowListener(): void
+    {
+        $this->app?->bind(ClockServiceInterface::class, ClockFakeService::class);
+
+        Event::listen(WalletCreatedEventInterface::class, WalletCreatedThrowListener::class);
+
+        /** @var UserMulti $user */
+        $user = UserMultiFactory::new()->create();
+
+        $uuidFactoryService = app(UuidFactoryServiceInterface::class);
+        $uuid = $uuidFactoryService->uuid4();
+
+        $holderType = $user->getMorphClass();
+        $createdAt = app(ClockServiceInterface::class)->now()->format(DateTimeInterface::ATOM);
+
+        $message = hash('sha256', $holderType . $uuid . $createdAt);
+
+        // unit
+        $this->expectException(UnknownEventException::class);
+        $this->expectExceptionMessage($message);
+
+        $user->createWallet([
+            'uuid' => $uuid,
+            'name' => 'test',
+        ]);
+    }
+
+    /**
+     * @throws ExceptionInterface
+     */
+    public function testBalanceNotChanged(): void
+    {
+        Event::listen(BalanceUpdatedEventInterface::class, BalanceUpdatedThrowIdListener::class);
+
+        /** @var Buyer $buyer */
+        $buyer = BuyerFactory::new()->create();
+        self::assertSame(0, $buyer->wallet->balanceInt);
+
+        self::assertNotNull($buyer->deposit(0)); // no event
+        self::assertNotNull($buyer->withdraw(0)); // no event
+
+        app(DatabaseServiceInterface::class)->transaction(function () use ($buyer) {
+            $transaction = $buyer->deposit(100);
+            self::assertNotNull($transaction);
+            self::assertSame(100, $transaction->amountInt);
+
+            $transaction = $buyer->withdraw(100);
+            self::assertNotNull($transaction);
+            self::assertSame(-100, $transaction->amountInt);
+        }); // no event
+
+        /**
+         * The balance has not changed. Balance update event will not be generated.
+         */
+        self::assertSame(0, $buyer->balanceInt);
+        self::assertCount(4, $buyer->transactions()->get());
+    }
+
+    /**
+     * @throws ExceptionInterface
+     */
+    public function testTransactionCreatedThrowListener(): void
+    {
+        $this->app?->bind(ClockServiceInterface::class, ClockFakeService::class);
+
+        Event::listen(TransactionCreatedEventInterface::class, TransactionCreatedThrowListener::class);
+
+        /** @var Buyer $buyer */
+        $buyer = BuyerFactory::new()->create();
+        self::assertSame(0, $buyer->wallet->balanceInt);
+
+        $createdAt = app(ClockServiceInterface::class)
+            ->now()
+            ->format(DateTimeInterface::ATOM)
+        ;
+
+        $message = hash('sha256', Transaction::TYPE_DEPOSIT . $createdAt);
+
+        // unit
+        $this->expectException(UnknownEventException::class);
+        $this->expectExceptionMessage($message);
+
+        $buyer->deposit(100);
+    }
+
+    /**
+     * @throws ExceptionInterface
+     */
+    public function testTransactionCreatedMultiListener(): void
+    {
+        /** @var array<array<int, int>> $transactionIds */
+        $transactionIds = [];
+        /** @var array<array<int, int>> $transactionCounts */
+        $transactionCounts = [];
+        Event::listen(
+            TransactionCreatedEventInterface::class,
+            static function (TransactionCreatedEventInterface $event) use (
+                &$transactionIds,
+                &$transactionCounts
+            ): void {
+                $transactionCounts[$event->getWalletId()] = ($transactionCounts[$event->getWalletId()] ?? 0) + 1;
+                $transactionIds[$event->getWalletId()][] = $event->getId();
+            },
+        );
+
+        /** @var Buyer $buyer */
+        $buyer = BuyerFactory::new()->create();
+        self::assertSame(0, $buyer->wallet->balanceInt);
+
+        /** @var Collection<int, Item> $products */
+        $products = ItemFactory::times(10)->create([
+            'quantity' => 1,
+        ]);
+
+        $cart = app(Cart::class)->withItems($products);
+        foreach ($cart->getItems() as $product) {
+            self::assertSame(0, $product->getBalanceIntAttribute());
+        }
+
+        self::assertSame($buyer->balance, $buyer->wallet->balance);
+
+        $depositTransaction = $buyer->deposit($cart->getTotal($buyer));
+        self::assertNotNull($depositTransaction); // +1
+
+        self::assertSame($buyer->balance, $buyer->wallet->balance);
+
+        $transfers = $buyer->payCart($cart); // +10
+        self::assertCount(count($cart), $transfers);
+        self::assertTrue((bool) app(PurchaseServiceInterface::class)->already($buyer, $cart->getBasketDto()));
+        self::assertSame(0, $buyer->balanceInt);
+
+        $resultIds = [$depositTransaction->getKey()];
+        $valueIds = $transactionIds[$buyer->wallet->getKey()] ?? [];
+        foreach ($transfers as $transfer) {
+            $resultIds[] = $transfer->withdraw->getKey();
+            self::assertSame(1, $transactionCounts[$transfer->deposit->wallet_id] ?? 0);
+        }
+
+        sort($valueIds);
+        sort($resultIds);
+
+        self::assertSame(1 + 20, array_sum($transactionCounts)); // deposit+withdraw
+        self::assertSame(1 + 10, $transactionCounts[$buyer->wallet->getKey()] ?? 0);
+
+        self::assertCount(1 + 10, $resultIds);
+        self::assertCount(1 + 10, $valueIds);
+
+        self::assertSame($valueIds, $resultIds);
+    }
+}
