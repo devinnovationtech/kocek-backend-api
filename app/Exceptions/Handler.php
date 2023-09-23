@@ -3,6 +3,9 @@
 namespace App\Exceptions;
 
 use Illuminate\Foundation\Exceptions\Handler as ExceptionHandler;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Throwable;
 
 class Handler extends ExceptionHandler
@@ -21,10 +24,31 @@ class Handler extends ExceptionHandler
     /**
      * Register the exception handling callbacks for the application.
      */
-    public function register(): void
+    public function register()
     {
         $this->reportable(function (Throwable $e) {
-            //
+            if ($e instanceof \Illuminate\Auth\AuthenticationException) {
+                return response()->json(['error' => 'Unauthenticated.'], 401);
+            }
         });
+    }
+
+    public function render($request, Throwable $exception)
+    {
+        if (!$request->expectsJson()) {
+            if ($exception instanceof ModelNotFoundException || $exception instanceof NotFoundHttpException) {
+                return new JsonResponse([
+                    'status' => false,
+                    'error' => 'Resource not found',
+                ], 404);
+            }
+
+            return new JsonResponse([
+                'status' => false,
+                'error' => $exception->getMessage(),
+            ], 500);
+        }
+
+        return parent::render($request, $exception);
     }
 }
